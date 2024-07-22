@@ -27,7 +27,7 @@ from diffusers.models.lora import LoRACompatibleConv, LoRACompatibleLinear
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils.import_utils import is_xformers_available
 
-from einops import rearrange
+from einops import rearrange, repeat
 import pdb
 import random
 
@@ -37,6 +37,15 @@ if is_xformers_available():
     import xformers.ops
 else:
     xformers = None
+
+def my_repeat(tensor, num_repeats):
+    """
+    Repeat a tensor along a given dimension
+    """
+    if len(tensor.shape) == 3:
+        return repeat(tensor,  "b d c -> (b v) d c", v=num_repeats)
+    elif len(tensor.shape) == 4:
+        return repeat(tensor,  "a b d c -> (a v) b d c", v=num_repeats)
 
 
 @dataclass
@@ -104,10 +113,11 @@ class TransformerMV2DModel(ModelMixin, ConfigMixin):
         norm_type: str = "layer_norm",
         norm_elementwise_affine: bool = True,
         num_views: int = 1,
-        joint_attention: bool=False,
-        joint_attention_twice: bool=False,
+        cd_attention_last: bool=False,
+        cd_attention_mid: bool=False,
         multiview_attention: bool=True,
-        cross_domain_attention: bool=False
+        sparse_mv_attention: bool = False,
+        mvcd_attention: bool=False
     ):
         super().__init__()
         self.use_linear_projection = use_linear_projection
@@ -201,10 +211,11 @@ class TransformerMV2DModel(ModelMixin, ConfigMixin):
                     norm_type=norm_type,
                     norm_elementwise_affine=norm_elementwise_affine,
                     num_views=num_views,
-                    joint_attention=joint_attention,
-                    joint_attention_twice=joint_attention_twice,
+                    cd_attention_last=cd_attention_last,
+                    cd_attention_mid=cd_attention_mid,
                     multiview_attention=multiview_attention,
-                    cross_domain_attention=cross_domain_attention
+                    sparse_mv_attention=sparse_mv_attention,
+                    mvcd_attention=mvcd_attention
                 )
                 for d in range(num_layers)
             ]
@@ -403,10 +414,11 @@ class BasicMVTransformerBlock(nn.Module):
         norm_type: str = "layer_norm",
         final_dropout: bool = False,
         num_views: int = 1,
-        joint_attention: bool = False,
-        joint_attention_twice: bool = False,
+        cd_attention_last: bool = False,
+        cd_attention_mid: bool = False,
         multiview_attention: bool = True,
-        cross_domain_attention: bool = False
+        sparse_mv_attention: bool = False,
+        mvcd_attention: bool = False
     ):
         super().__init__()
         self.only_cross_attention = only_cross_attention
@@ -430,7 +442,8 @@ class BasicMVTransformerBlock(nn.Module):
             self.norm1 = nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine)
 
         self.multiview_attention = multiview_attention
-        self.cross_domain_attention = cross_domain_attention
+        self.sparse_mv_attention = sparse_mv_attention
+        self.mvcd_attention = mvcd_attention
         
         self.attn1 = CustomAttention(
             query_dim=dim,
@@ -476,11 +489,11 @@ class BasicMVTransformerBlock(nn.Module):
 
         self.num_views = num_views
 
-        self.joint_attention = joint_attention
+        self.cd_attention_last = cd_attention_last
 
-        if self.joint_attention:
+        if self.cd_attention_last:
             # Joint task -Attn
-            self.attn_joint = CustomJointAttention(
+            self.attn_joint_last = CustomJointAttention(
                 query_dim=dim,
                 heads=num_attention_heads,
                 dim_head=attention_head_dim,
@@ -490,16 +503,16 @@ class BasicMVTransformerBlock(nn.Module):
                 upcast_attention=upcast_attention,
                 processor=JointAttnProcessor()
             )
-            nn.init.zeros_(self.attn_joint.to_out[0].weight.data)
-            self.norm_joint = AdaLayerNorm(dim, num_embeds_ada_norm) if self.use_ada_layer_norm else nn.LayerNorm(dim)
+            nn.init.zeros_(self.attn_joint_last.to_out[0].weight.data)
+            self.norm_joint_last = AdaLayerNorm(dim, num_embeds_ada_norm) if self.use_ada_layer_norm else nn.LayerNorm(dim)
 
 
-        self.joint_attention_twice = joint_attention_twice
+        self.cd_attention_mid = cd_attention_mid
 
-        if self.joint_attention_twice:
-            print("joint twice")
+        if self.cd_attention_mid:
+            # print("cross-domain attn in the middle")
             # Joint task -Attn
-            self.attn_joint_twice = CustomJointAttention(
+            self.attn_joint_mid = CustomJointAttention(
                 query_dim=dim,
                 heads=num_attention_heads,
                 dim_head=attention_head_dim,
@@ -509,8 +522,8 @@ class BasicMVTransformerBlock(nn.Module):
                 upcast_attention=upcast_attention,
                 processor=JointAttnProcessor()
             )
-            nn.init.zeros_(self.attn_joint_twice.to_out[0].weight.data)
-            self.norm_joint_twice = AdaLayerNorm(dim, num_embeds_ada_norm) if self.use_ada_layer_norm else nn.LayerNorm(dim)
+            nn.init.zeros_(self.attn_joint_mid.to_out[0].weight.data)
+            self.norm_joint_mid = AdaLayerNorm(dim, num_embeds_ada_norm) if self.use_ada_layer_norm else nn.LayerNorm(dim)
 
     def set_chunk_feed_forward(self, chunk_size: Optional[int], dim: int):
         # Sets chunk feed-forward
@@ -547,7 +560,8 @@ class BasicMVTransformerBlock(nn.Module):
             attention_mask=attention_mask,
             num_views=self.num_views,
             multiview_attention=self.multiview_attention,
-            cross_domain_attention=self.cross_domain_attention,
+            sparse_mv_attention=self.sparse_mv_attention,
+            mvcd_attention=self.mvcd_attention,
             **cross_attention_kwargs,
         )
 
@@ -557,11 +571,11 @@ class BasicMVTransformerBlock(nn.Module):
         hidden_states = attn_output + hidden_states
 
         # joint attention twice
-        if self.joint_attention_twice:
+        if self.cd_attention_mid:
             norm_hidden_states = (
-                self.norm_joint_twice(hidden_states, timestep) if self.use_ada_layer_norm else self.norm_joint_twice(hidden_states)
+                self.norm_joint_mid(hidden_states, timestep) if self.use_ada_layer_norm else self.norm_joint_mid(hidden_states)
             )
-            hidden_states = self.attn_joint_twice(norm_hidden_states) + hidden_states
+            hidden_states = self.attn_joint_mid(norm_hidden_states) + hidden_states
 
         # 2. Cross-Attention
         if self.attn2 is not None:
@@ -603,11 +617,11 @@ class BasicMVTransformerBlock(nn.Module):
 
         hidden_states = ff_output + hidden_states
 
-        if self.joint_attention:
+        if self.cd_attention_last:
             norm_hidden_states = (
-                self.norm_joint(hidden_states, timestep) if self.use_ada_layer_norm else self.norm_joint(hidden_states)
+                self.norm_joint_last(hidden_states, timestep) if self.use_ada_layer_norm else self.norm_joint_last(hidden_states)
             )
-            hidden_states = self.attn_joint(norm_hidden_states) + hidden_states
+            hidden_states = self.attn_joint_last(norm_hidden_states) + hidden_states
 
         return hidden_states
     
@@ -678,40 +692,8 @@ class MVAttnProcessor:
         # pdb.set_trace()
         # multi-view self-attention
         if multiview_attention:
-            if num_views <= 6:
-                # after use xformer; possible to train with 6 views
-                key = rearrange(key, "(b t) d c -> b (t d) c", t=num_views).repeat_interleave(num_views, dim=0)
-                value = rearrange(value, "(b t) d c -> b (t d) c", t=num_views).repeat_interleave(num_views, dim=0)
-            else:# apply sparse attention
-                pass
-                # print("use sparse attention")  
-                # # seems that the sparse random sampling cause problems
-                # # don't use random sampling, just fix the indexes
-                # onekey = rearrange(key, "(b t) d c -> b t d c", t=num_views) 
-                # onevalue = rearrange(value, "(b t) d c -> b t d c", t=num_views)
-                # allkeys = []
-                # allvalues = []
-                # all_indexes = {
-                #     0 : [0, 2, 3, 4],
-                #     1: [0, 1, 3, 5],
-                #     2: [0, 2, 3, 4],
-                #     3: [0, 2, 3, 4],
-                #     4: [0, 2, 3, 4],
-                #     5: [0, 1, 3, 5]
-                # }
-                # for jj in range(num_views):
-                #     # valid_index = [x for x in range(0, num_views) if x!= jj]
-                #     # indexes = random.sample(valid_index, 3) + [jj] + [0]
-                #     indexes = all_indexes[jj]
-
-                #     indexes = torch.tensor(indexes).long().to(key.device)
-                #     allkeys.append(onekey[:, indexes])
-                #     allvalues.append(onevalue[:, indexes])
-                # keys = torch.stack(allkeys, dim=1) # checked, should be dim=1
-                # values = torch.stack(allvalues, dim=1) 
-                # key = rearrange(keys, 'b t f d c -> (b t) (f d) c')
-                # value = rearrange(values, 'b t f d c -> (b t) (f d) c')
-
+            key = rearrange(key, "(b t) d c -> b (t d) c", t=num_views).repeat_interleave(num_views, dim=0)
+            value = rearrange(value, "(b t) d c -> b (t d) c", t=num_views).repeat_interleave(num_views, dim=0)
 
         query = attn.head_to_batch_dim(query).contiguous()
         key = attn.head_to_batch_dim(key).contiguous()
@@ -751,7 +733,8 @@ class XFormersMVAttnProcessor:
         temb=None,
         num_views=1.,
         multiview_attention=True,
-        cross_domain_attention=False,
+        sparse_mv_attention=False,
+        mvcd_attention=False,
     ):
         residual = hidden_states
 
@@ -798,17 +781,15 @@ class XFormersMVAttnProcessor:
         # pdb.set_trace()
         # multi-view self-attention
         if multiview_attention:
-            key = rearrange(key_raw, "(b t) d c -> b (t d) c", t=num_views).repeat_interleave(num_views, dim=0)
-            value = rearrange(value_raw, "(b t) d c -> b (t d) c", t=num_views).repeat_interleave(num_views, dim=0)
+            if not sparse_mv_attention:
+                key = my_repeat(rearrange(key_raw, "(b t) d c -> b (t d) c", t=num_views), num_views)
+                value = my_repeat(rearrange(value_raw, "(b t) d c -> b (t d) c", t=num_views), num_views)
+            else:
+                key_front = my_repeat(rearrange(key_raw, "(b t) d c -> b t d c", t=num_views)[:, 0, :, :], num_views) # [(b t), d, c]
+                value_front = my_repeat(rearrange(value_raw, "(b t) d c -> b t d c", t=num_views)[:, 0, :, :], num_views)
+                key = torch.cat([key_front, key_raw], dim=1) # shape (b t) (2 d) c
+                value = torch.cat([value_front, value_raw], dim=1)
 
-            if cross_domain_attention:
-                # memory efficient, cross domain attention
-                key_0, key_1 = torch.chunk(key_raw, dim=0, chunks=2)  # keys shape (b t) d c
-                value_0, value_1 = torch.chunk(value_raw, dim=0, chunks=2)
-                key_cross = torch.concat([key_1, key_0], dim=0)
-                value_cross = torch.concat([value_1, value_0], dim=0) #  shape (b t) d c
-                key = torch.cat([key, key_cross], dim=1)
-                value = torch.cat([value, value_cross], dim=1)  #  shape (b t) (t+1 d) c
         else:
             # print("don't use multiview attention.")
             key = key_raw
